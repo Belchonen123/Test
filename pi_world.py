@@ -4,7 +4,7 @@ Run:
     pip install mpmath colorama
     python pi_world.py
 
-Controls: wasd move, WASD sprint (2 tiles), q quit, r restart on death.
+Controls: wasd move, WASD sprint, c conjure, q quit, r restart on death.
 """
 
 import json
@@ -26,6 +26,8 @@ START_DIGIT = 1047
 VIEW_W, VIEW_H = 21, 11
 SIGHT_RADIUS = 4
 START_HP = 10
+START_MANA = 3
+MAX_MANA = 5
 SCORE_FILE = os.path.expanduser('~/.pi_world_score')
 
 
@@ -141,6 +143,20 @@ def hp_bar(hp):
     return ''.join(full if i < shown else empty for i in range(START_HP))
 
 
+def mana_bar(mana):
+    shown = max(0, min(MAX_MANA, mana))
+    full = Fore.LIGHTBLUE_EX + Style.BRIGHT + '*' + Style.RESET_ALL
+    empty = Fore.LIGHTBLACK_EX + '-' + Style.RESET_ALL
+    return ''.join(full if i < shown else empty for i in range(MAX_MANA))
+
+
+def effective_tile(state, x, y):
+    t = tile_at(x, y)
+    if t == WATER and (x, y) in state['conjured']:
+        return GRASS
+    return t
+
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
@@ -184,8 +200,8 @@ def draw(state):
         combo_str = '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
     print('{}   pos ({:>4},{:>4})   score {} ({})   bosses {}   steps {}{}'.format(
         title, px, py, score_str, best_str, boss_str, state['steps'], combo_str))
-    hint = Fore.LIGHTBLACK_EX + 'wasd move  WASD sprint  q quit' + Style.RESET_ALL
-    print('HP [{}]   {}'.format(hp_bar(state['hp']), hint))
+    hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  q quit' + Style.RESET_ALL
+    print('HP [{}]  MP [{}]   {}'.format(hp_bar(state['hp']), mana_bar(state['mana']), hint))
     border = '+' + '-' * VIEW_W + '+'
     print(border)
     seen = state['seen']
@@ -198,11 +214,11 @@ def draw(state):
             wx = px - half_w + vx
             wy = py - half_h + vy
             if wx == px and wy == py:
-                line += player_glyph(tile_at(wx, wy))
+                line += player_glyph(effective_tile(state, wx, wy))
             elif (wx, wy) not in seen:
                 line += render_unknown()
             else:
-                t = tile_at(wx, wy)
+                t = effective_tile(state, wx, wy)
                 if t == TREASURE and (wx, wy) in collected:
                     line += render_tile(GRASS)
                 elif healing_at(wx, wy) and (wx, wy) not in used_fountains:
@@ -226,10 +242,11 @@ def draw(state):
 def fresh_state(best):
     state = {
         'px': 0, 'py': 0,
-        'score': 0, 'hp': START_HP, 'steps': 0, 'bosses': 0, 'combo': 0,
+        'score': 0, 'hp': START_HP, 'mana': START_MANA, 'steps': 0, 'bosses': 0, 'combo': 0,
         'best': best,
-        'seen': set(), 'collected': set(), 'defeated': set(), 'used_fountains': set(),
-        'log': ['Welcome to Pi World! $ treasure  E enemy  B boss  + fountain'],
+        'seen': set(), 'collected': set(), 'defeated': set(),
+        'used_fountains': set(), 'conjured': set(),
+        'log': ['Welcome to Pi World! $ treasure  E enemy  B boss  + fountain  c conjure'],
     }
     update_seen(state['seen'], 0, 0)
     return state
@@ -238,7 +255,7 @@ def fresh_state(best):
 def try_move(state, dx, dy):
     """Apply one step of (dx, dy). Returns False if blocked by water."""
     nx, ny = state['px'] + dx, state['py'] + dy
-    target = tile_at(nx, ny)
+    target = effective_tile(state, nx, ny)
     if target == WATER:
         state['log'].append(Fore.CYAN + 'Splash! Water blocks your path.' + Style.RESET_ALL)
         return False
@@ -273,18 +290,83 @@ def try_move(state, dx, dy):
         state['combo'] += 1
         bonus = state['combo']
         state['score'] += bonus
+        gained_mana = state['mana'] < MAX_MANA
+        state['mana'] = min(MAX_MANA, state['mana'] + 1)
+        suffix = ', +1 MP' if gained_mana else ''
         if bonus > 1:
             state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                                + 'Treasure! +{} (combo x{})'.format(bonus, state['combo'])
+                                + 'Treasure! +{} (combo x{}){}'.format(bonus, state['combo'], suffix)
                                 + Style.RESET_ALL)
         else:
             state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                                + 'You found treasure! +1' + Style.RESET_ALL)
+                                + 'You found treasure! +1{}'.format(suffix) + Style.RESET_ALL)
     elif target == MOUNTAIN:
         state['log'].append('You scramble up a rocky slope.')
     elif target == FOREST:
         state['log'].append('You push through the trees.')
     return True
+
+
+def conjure(state):
+    """Cast a spell whose effect is determined by the pi digit at the player's tile."""
+    if state['mana'] <= 0:
+        state['log'].append(Fore.LIGHTBLACK_EX + 'No mana to conjure.' + Style.RESET_ALL)
+        return
+    state['mana'] -= 1
+    px, py = state['px'], state['py']
+    d = int(PI_DIGITS[_pi_index(px, py)])
+
+    if d <= 1:
+        # Tide: turn nearby water into walkable grass
+        count = 0
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                if dx * dx + dy * dy <= 9:
+                    wx, wy = px + dx, py + dy
+                    if tile_at(wx, wy) == WATER and (wx, wy) not in state['conjured']:
+                        state['conjured'].add((wx, wy))
+                        count += 1
+        state['log'].append(Fore.CYAN + Style.BRIGHT
+                            + 'TIDE conjured: {} water tiles parted.'.format(count)
+                            + Style.RESET_ALL)
+    elif d <= 3:
+        # Sight: permanently reveal a wide ring around the player
+        for dy in range(-9, 10):
+            for dx in range(-9, 10):
+                if dx * dx + dy * dy <= 81:
+                    state['seen'].add((px + dx, py + dy))
+        state['log'].append(Fore.LIGHTCYAN_EX + Style.BRIGHT
+                            + 'SIGHT conjured: distant lands revealed.' + Style.RESET_ALL)
+    elif d <= 5:
+        # Mend: heal HP
+        heal = min(START_HP - state['hp'], 3)
+        state['hp'] += heal
+        state['log'].append(Fore.LIGHTGREEN_EX + Style.BRIGHT
+                            + 'MEND conjured: +{} HP.'.format(heal) + Style.RESET_ALL)
+    elif d <= 7:
+        # Ward: banish nearby foes
+        count = 0
+        bosses = 0
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                if dx * dx + dy * dy <= 4:
+                    wx, wy = px + dx, py + dy
+                    kind = enemy_kind(wx, wy)
+                    if kind and (wx, wy) not in state['defeated']:
+                        state['defeated'].add((wx, wy))
+                        count += 1
+                        if kind == 'boss':
+                            bosses += 1
+                            state['bosses'] += 1
+                            state['score'] += 5
+        state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
+                            + 'WARD conjured: {} foes banished ({} boss).'.format(count, bosses)
+                            + Style.RESET_ALL)
+    else:
+        # Hoard: pull score from thin air
+        state['score'] += 5
+        state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+                            + 'HOARD conjured: +5 score from the digits.' + Style.RESET_ALL)
 
 
 def end_screen(state, message):
@@ -317,6 +399,9 @@ def run_game(best):
         if ch == 'q':
             end_screen(state, 'Thanks for exploring Pi World!')
             return 'quit', state['score']
+        if ch == 'c':
+            conjure(state)
+            continue
         if ch not in moves:
             continue
         sprint = raw != ch  # uppercase WASD means sprint two tiles
