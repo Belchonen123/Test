@@ -4,7 +4,7 @@ Run:
     pip install mpmath colorama
     python pi_world.py
 
-Controls: wasd move, WASD sprint, c conjure, q quit, r restart on death.
+Controls: wasd move, WASD sprint, c conjure, h help, q quit, r restart on death.
 """
 
 import json
@@ -281,9 +281,10 @@ def draw(state):
         extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
     if is_crit_tile(px, py):
         extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'CRIT READY' + Style.RESET_ALL
+    extras += '   ' + Fore.LIGHTBLUE_EX + 'next: ' + conjure_preview(state) + Style.RESET_ALL
     print('{}   pos ({:>4},{:>4})   {}   score {} ({})   bosses {}   steps {}{}'.format(
         title, px, py, lvl_str, score_str, best_str, boss_str, state['steps'], extras))
-    hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  q quit' + Style.RESET_ALL
+    hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  h help  q quit' + Style.RESET_ALL
     print('HP [{}]  MP [{}]  inv {}   {}'.format(
         hp_bar(state['hp'], state['hp_max']), mana_bar(state['mana'], state['mana_max']),
         inventory_str(state), hint))
@@ -327,6 +328,42 @@ def draw(state):
         print(entry if entry else ' ')
 
 
+def show_help():
+    clear_screen()
+    print(Style.BRIGHT + Fore.CYAN + 'Pi World - help' + Style.RESET_ALL)
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Controls' + Style.RESET_ALL)
+    print('  wasd   walk one tile           WASD   sprint two tiles')
+    print('  c      conjure (cost 1 MP)     h, ?   this help')
+    print('  q      quit                    r      restart (after death)')
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Legend' + Style.RESET_ALL)
+    print('  {}  you      {}  water (impassable)'.format(player_glyph(GRASS), render_tile(WATER)))
+    print('  {}  grass    {}  forest    {}  mountain    {}  treasure'.format(
+        render_tile(GRASS), render_tile(FOREST), render_tile(MOUNTAIN), render_tile(TREASURE)))
+    print('  {}  enemy    {}  boss      {}  fountain'.format(
+        render_enemy(GRASS), render_boss(GRASS), render_fountain(GRASS)))
+    print('  {}  sword    {}  shield    {}  ring'.format(
+        render_item('sword', GRASS), render_item('shield', FOREST), render_item('ring', MOUNTAIN)))
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Combat' + Style.RESET_ALL)
+    print('  Walk into a foe to strike. Damage = 1 base, +1 if you stand on a 7-digit (CRIT),')
+    print('  +1 with sword. Adjacent live foes counter-attack at the end of every turn.')
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Conjure spells (1 MP, chosen by pi digit at your tile)' + Style.RESET_ALL)
+    print('  0-1  TIDE    part nearby water         2-3  SIGHT  reveal a wide ring')
+    print('  4-5  MEND    +3 HP                     6-7  WARD   banish foes within 2')
+    print('  8-9  HOARD   +5 score (x depth)')
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Scaling' + Style.RESET_ALL)
+    print('  Depth multiplier = 1 + (chebyshev distance from origin // 20)')
+    print('  Treasure combo grows with consecutive pickups; broken by retaliation damage.')
+    print('  XP from kills and treasures earns levels: +2 max HP, +1 max MP, full restore.')
+    print()
+    print(Fore.LIGHTBLACK_EX + 'Press any key to return.' + Style.RESET_ALL)
+    getch()
+
+
 def fresh_state(best):
     state = {
         'px': 0, 'py': 0,
@@ -339,9 +376,28 @@ def fresh_state(best):
         'used_fountains': set(), 'conjured': set(), 'items_picked': set(),
         'has_sword': False, 'has_shield': False, 'has_ring': False,
         'enemy_hp': {},
-        'log': ['Welcome! Earn XP to level up. Treasures, enemies, and bosses give XP.'],
+        'log': ['Welcome! Press h for help. Earn XP to level up.'],
     }
     update_seen(state['seen'], 0, 0)
+    # Claim the tile you wake up on so initial treasure/items are not stranded.
+    if tile_at(0, 0) == TREASURE:
+        state['collected'].add((0, 0))
+        state['combo'] = 1
+        state['score'] = 1
+        gain_xp(state, XP_TREASURE)
+        state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+                            + 'You wake on treasure! +1 score' + Style.RESET_ALL)
+    item = item_at(0, 0)
+    if item:
+        state['items_picked'].add((0, 0))
+        if item == 'sword':
+            state['has_sword'] = True
+        elif item == 'shield':
+            state['has_shield'] = True
+        elif item == 'ring':
+            state['has_ring'] = True
+            state['mana_max'] += 2
+            state['mana'] = min(state['mana_max'], state['mana'] + 2)
     return state
 
 
@@ -354,6 +410,13 @@ CRIT_DIGIT = '7'
 
 def is_crit_tile(x, y):
     return PI_DIGITS[_pi_index(x, y)] == CRIT_DIGIT
+
+
+SPELL_BY_DIGIT = ['TIDE', 'TIDE', 'SIGHT', 'SIGHT', 'MEND', 'MEND', 'WARD', 'WARD', 'HOARD', 'HOARD']
+
+
+def conjure_preview(state):
+    return SPELL_BY_DIGIT[int(PI_DIGITS[_pi_index(state['px'], state['py'])])]
 
 
 def depth(x, y):
@@ -609,6 +672,9 @@ def run_game(best):
         if ch == 'q':
             end_screen(state, 'Thanks for exploring Pi World!')
             return 'quit', state['score']
+        if ch == 'h' or raw == '?':
+            show_help()
+            continue
         if ch == 'c':
             conjure(state)
             enemy_retaliation(state)
