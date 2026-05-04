@@ -92,6 +92,23 @@ def healing_at(x, y):
     return b == a + 1 and c == b + 1
 
 
+def item_at(x, y):
+    """Sword on grass / shield on forest / ring on mountain, when pi has a matching pair."""
+    t = tile_at(x, y)
+    i = _pi_index(x, y)
+    a = PI_DIGITS[(i + 1) % PI_LEN]
+    b = PI_DIGITS[(i + 2) % PI_LEN]
+    if a != b:
+        return None
+    if t == GRASS and a == '5':
+        return 'sword'
+    if t == FOREST and a == '7':
+        return 'shield'
+    if t == MOUNTAIN and a == '3':
+        return 'ring'
+    return None
+
+
 def render_tile(t):
     if t == WATER:
         return Back.BLUE + Fore.CYAN + '~' + Style.RESET_ALL
@@ -128,6 +145,17 @@ def render_fountain(under):
     return _bg_for(under) + Fore.LIGHTCYAN_EX + Style.BRIGHT + '+' + Style.RESET_ALL
 
 
+def render_item(kind, under):
+    bg = _bg_for(under)
+    if kind == 'sword':
+        return bg + Fore.LIGHTWHITE_EX + Style.BRIGHT + '/' + Style.RESET_ALL
+    if kind == 'shield':
+        return bg + Fore.LIGHTWHITE_EX + Style.BRIGHT + 'o' + Style.RESET_ALL
+    if kind == 'ring':
+        return bg + Fore.LIGHTYELLOW_EX + Style.BRIGHT + '*' + Style.RESET_ALL
+    return bg + ' ' + Style.RESET_ALL
+
+
 def render_unknown():
     return Back.BLACK + Fore.LIGHTBLACK_EX + ' ' + Style.RESET_ALL
 
@@ -143,11 +171,23 @@ def hp_bar(hp):
     return ''.join(full if i < shown else empty for i in range(START_HP))
 
 
-def mana_bar(mana):
-    shown = max(0, min(MAX_MANA, mana))
+def mana_bar(mana, mana_max):
+    shown = max(0, min(mana_max, mana))
     full = Fore.LIGHTBLUE_EX + Style.BRIGHT + '*' + Style.RESET_ALL
     empty = Fore.LIGHTBLACK_EX + '-' + Style.RESET_ALL
-    return ''.join(full if i < shown else empty for i in range(MAX_MANA))
+    return ''.join(full if i < shown else empty for i in range(mana_max))
+
+
+def inventory_str(state):
+    def slot(owned, ch, color):
+        if owned:
+            return color + Style.BRIGHT + ch + Style.RESET_ALL
+        return Fore.LIGHTBLACK_EX + ch + Style.RESET_ALL
+    return ' '.join([
+        slot(state['has_sword'], '/', Fore.LIGHTWHITE_EX),
+        slot(state['has_shield'], 'o', Fore.LIGHTWHITE_EX),
+        slot(state['has_ring'], '*', Fore.LIGHTYELLOW_EX),
+    ])
 
 
 def effective_tile(state, x, y):
@@ -203,7 +243,9 @@ def draw(state):
     print('{}   pos ({:>4},{:>4})   score {} ({})   bosses {}   steps {}{}'.format(
         title, px, py, score_str, best_str, boss_str, state['steps'], extras))
     hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  q quit' + Style.RESET_ALL
-    print('HP [{}]  MP [{}]   {}'.format(hp_bar(state['hp']), mana_bar(state['mana']), hint))
+    print('HP [{}]  MP [{}]  inv {}   {}'.format(
+        hp_bar(state['hp']), mana_bar(state['mana'], state['mana_max']),
+        inventory_str(state), hint))
     border = '+' + '-' * VIEW_W + '+'
     print(border)
     seen = state['seen']
@@ -221,10 +263,13 @@ def draw(state):
                 line += render_unknown()
             else:
                 t = effective_tile(state, wx, wy)
+                item = item_at(wx, wy)
                 if t == TREASURE and (wx, wy) in collected:
                     line += render_tile(GRASS)
                 elif healing_at(wx, wy) and (wx, wy) not in used_fountains:
                     line += render_fountain(t)
+                elif item and (wx, wy) not in state['items_picked']:
+                    line += render_item(item, t)
                 else:
                     kind = enemy_kind(wx, wy)
                     if kind and (wx, wy) not in defeated:
@@ -244,12 +289,14 @@ def draw(state):
 def fresh_state(best):
     state = {
         'px': 0, 'py': 0,
-        'score': 0, 'hp': START_HP, 'mana': START_MANA, 'steps': 0, 'bosses': 0, 'combo': 0,
+        'score': 0, 'hp': START_HP, 'mana': START_MANA, 'mana_max': MAX_MANA,
+        'steps': 0, 'bosses': 0, 'combo': 0,
         'best': best,
         'seen': set(), 'collected': set(), 'defeated': set(),
-        'used_fountains': set(), 'conjured': set(),
+        'used_fountains': set(), 'conjured': set(), 'items_picked': set(),
+        'has_sword': False, 'has_shield': False, 'has_ring': False,
         'enemy_hp': {},
-        'log': ['Welcome! Stand on a 7-digit tile for CRIT, then walk into a foe to fight.'],
+        'log': ['Welcome! / sword  o shield  * ring   Stand on a 7-digit for CRIT.'],
     }
     update_seen(state['seen'], 0, 0)
     return state
@@ -268,13 +315,18 @@ def is_crit_tile(x, y):
 
 def attack_damage(state):
     crit = is_crit_tile(state['px'], state['py'])
-    return (2, True) if crit else (1, False)
+    base = 2 if crit else 1
+    if state['has_sword']:
+        base += 1
+    return base, crit
 
 
 def resolve_combat(state, kind, ex, ey):
     """Process one attack. Returns True if the enemy was defeated this hit."""
     max_hp = BOSS_MAX_HP if kind == 'boss' else ENEMY_MAX_HP
     counter = BOSS_COUNTER if kind == 'boss' else ENEMY_COUNTER
+    if state['has_shield']:
+        counter = max(0, counter - 1)
     cur = state['enemy_hp'].get((ex, ey), max_hp)
     dmg, crit = attack_damage(state)
     cur -= dmg
@@ -325,13 +377,33 @@ def try_move(state, dx, dy):
         state['log'].append(Fore.LIGHTCYAN_EX + Style.BRIGHT
                             + 'You drink from a fountain! +{} HP'.format(heal)
                             + Style.RESET_ALL)
+    item = item_at(nx, ny)
+    if item and (nx, ny) not in state['items_picked']:
+        state['items_picked'].add((nx, ny))
+        if item == 'sword':
+            state['has_sword'] = True
+            state['log'].append(Fore.LIGHTWHITE_EX + Style.BRIGHT
+                                + 'You pick up a sword! +1 attack damage.'
+                                + Style.RESET_ALL)
+        elif item == 'shield':
+            state['has_shield'] = True
+            state['log'].append(Fore.LIGHTWHITE_EX + Style.BRIGHT
+                                + 'You strap on a shield! Counters reduced by 1.'
+                                + Style.RESET_ALL)
+        elif item == 'ring':
+            state['has_ring'] = True
+            state['mana_max'] += 2
+            state['mana'] = min(state['mana_max'], state['mana'] + 2)
+            state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+                                + 'You slip on a ring! Max mana +2.'
+                                + Style.RESET_ALL)
     if target == TREASURE and (nx, ny) not in state['collected']:
         state['collected'].add((nx, ny))
         state['combo'] += 1
         bonus = state['combo']
         state['score'] += bonus
-        gained_mana = state['mana'] < MAX_MANA
-        state['mana'] = min(MAX_MANA, state['mana'] + 1)
+        gained_mana = state['mana'] < state['mana_max']
+        state['mana'] = min(state['mana_max'], state['mana'] + 1)
         suffix = ', +1 MP' if gained_mana else ''
         if bonus > 1:
             state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
