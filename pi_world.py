@@ -195,11 +195,13 @@ def draw(state):
     score_str = Style.BRIGHT + Fore.LIGHTYELLOW_EX + str(state['score']) + Style.RESET_ALL
     best_str = Fore.LIGHTBLACK_EX + 'best ' + str(state['best']) + Style.RESET_ALL
     boss_str = Style.BRIGHT + Fore.LIGHTMAGENTA_EX + str(state['bosses']) + Style.RESET_ALL
-    combo_str = ''
+    extras = ''
     if state['combo'] >= 2:
-        combo_str = '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
+        extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
+    if is_crit_tile(px, py):
+        extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'CRIT READY' + Style.RESET_ALL
     print('{}   pos ({:>4},{:>4})   score {} ({})   bosses {}   steps {}{}'.format(
-        title, px, py, score_str, best_str, boss_str, state['steps'], combo_str))
+        title, px, py, score_str, best_str, boss_str, state['steps'], extras))
     hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  q quit' + Style.RESET_ALL
     print('HP [{}]  MP [{}]   {}'.format(hp_bar(state['hp']), mana_bar(state['mana']), hint))
     border = '+' + '-' * VIEW_W + '+'
@@ -246,10 +248,58 @@ def fresh_state(best):
         'best': best,
         'seen': set(), 'collected': set(), 'defeated': set(),
         'used_fountains': set(), 'conjured': set(),
-        'log': ['Welcome to Pi World! $ treasure  E enemy  B boss  + fountain  c conjure'],
+        'enemy_hp': {},
+        'log': ['Welcome! Stand on a 7-digit tile for CRIT, then walk into a foe to fight.'],
     }
     update_seen(state['seen'], 0, 0)
     return state
+
+
+ENEMY_MAX_HP = 2
+BOSS_MAX_HP = 3
+ENEMY_COUNTER = 1
+BOSS_COUNTER = 2
+CRIT_DIGIT = '7'
+
+
+def is_crit_tile(x, y):
+    return PI_DIGITS[_pi_index(x, y)] == CRIT_DIGIT
+
+
+def attack_damage(state):
+    crit = is_crit_tile(state['px'], state['py'])
+    return (2, True) if crit else (1, False)
+
+
+def resolve_combat(state, kind, ex, ey):
+    """Process one attack. Returns True if the enemy was defeated this hit."""
+    max_hp = BOSS_MAX_HP if kind == 'boss' else ENEMY_MAX_HP
+    counter = BOSS_COUNTER if kind == 'boss' else ENEMY_COUNTER
+    cur = state['enemy_hp'].get((ex, ey), max_hp)
+    dmg, crit = attack_damage(state)
+    cur -= dmg
+    crit_label = (Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'CRIT! ' + Style.RESET_ALL) if crit else ''
+    if cur <= 0:
+        state['defeated'].add((ex, ey))
+        state['enemy_hp'].pop((ex, ey), None)
+        if kind == 'boss':
+            state['score'] += 5
+            state['bosses'] += 1
+            state['log'].append(crit_label + Fore.LIGHTMAGENTA_EX + Style.BRIGHT
+                                + '*** BOSS SLAIN *** +5 score' + Style.RESET_ALL)
+        else:
+            state['score'] += 1
+            state['log'].append(crit_label + Fore.LIGHTRED_EX + Style.BRIGHT
+                                + 'Enemy slain! +1 score' + Style.RESET_ALL)
+        return True
+    state['enemy_hp'][(ex, ey)] = cur
+    state['hp'] -= counter
+    state['combo'] = 0
+    label = 'boss' if kind == 'boss' else 'enemy'
+    state['log'].append(crit_label + Fore.LIGHTRED_EX
+                        + 'Strike {} ({} HP left). It counters -{} HP.'.format(label, cur, counter)
+                        + Style.RESET_ALL)
+    return False
 
 
 def try_move(state, dx, dy):
@@ -261,18 +311,8 @@ def try_move(state, dx, dy):
         return False
     kind = enemy_kind(nx, ny)
     if kind and (nx, ny) not in state['defeated']:
-        state['defeated'].add((nx, ny))
-        state['combo'] = 0
-        if kind == 'boss':
-            state['hp'] -= 3
-            state['score'] += 5
-            state['bosses'] += 1
-            state['log'].append(Fore.LIGHTMAGENTA_EX + Style.BRIGHT
-                                + '*** BOSS SLAIN *** -3 HP, +5 score' + Style.RESET_ALL)
-        else:
-            state['hp'] -= 1
-            state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
-                                + 'You defeat an enemy! -1 HP' + Style.RESET_ALL)
+        if not resolve_combat(state, kind, nx, ny):
+            return False  # enemy survived; player stays on current tile
     state['px'], state['py'] = nx, ny
     state['steps'] += 1
     update_seen(state['seen'], nx, ny)
@@ -354,11 +394,14 @@ def conjure(state):
                     kind = enemy_kind(wx, wy)
                     if kind and (wx, wy) not in state['defeated']:
                         state['defeated'].add((wx, wy))
+                        state['enemy_hp'].pop((wx, wy), None)
                         count += 1
                         if kind == 'boss':
                             bosses += 1
                             state['bosses'] += 1
                             state['score'] += 5
+                        else:
+                            state['score'] += 1
         state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
                             + 'WARD conjured: {} foes banished ({} boss).'.format(count, bosses)
                             + Style.RESET_ALL)
