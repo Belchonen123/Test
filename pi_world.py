@@ -28,6 +28,12 @@ SIGHT_RADIUS = 4
 START_HP = 10
 START_MANA = 3
 MAX_MANA = 5
+
+# Cumulative XP required to reach each level (index 0 = level 1 with 0 XP).
+LEVEL_THRESHOLDS = [0, 5, 12, 22, 35, 55, 80, 110, 150]
+XP_TREASURE = 1
+XP_ENEMY = 2
+XP_BOSS = 10
 SCORE_FILE = os.path.expanduser('~/.pi_world_score')
 
 
@@ -164,11 +170,37 @@ def player_glyph(under):
     return _bg_for(under) + Fore.LIGHTRED_EX + Style.BRIGHT + '@' + Style.RESET_ALL
 
 
-def hp_bar(hp):
-    shown = max(0, min(START_HP, hp))
+def hp_bar(hp, hp_max):
+    shown = max(0, min(hp_max, hp))
     full = Fore.LIGHTRED_EX + Style.BRIGHT + '#' + Style.RESET_ALL
     empty = Fore.LIGHTBLACK_EX + '-' + Style.RESET_ALL
-    return ''.join(full if i < shown else empty for i in range(START_HP))
+    return ''.join(full if i < shown else empty for i in range(hp_max))
+
+
+def next_xp_threshold(level):
+    """XP needed for the next level, or None at max."""
+    if level >= len(LEVEL_THRESHOLDS):
+        return None
+    return LEVEL_THRESHOLDS[level]
+
+
+def gain_xp(state, amount):
+    if amount <= 0:
+        return
+    state['xp'] += amount
+    while state['level'] < len(LEVEL_THRESHOLDS):
+        need = LEVEL_THRESHOLDS[state['level']]
+        if state['xp'] < need:
+            break
+        state['level'] += 1
+        state['hp_max'] += 2
+        state['mana_max'] += 1
+        state['hp'] = state['hp_max']
+        state['mana'] = state['mana_max']
+        state['log'].append(Fore.LIGHTGREEN_EX + Style.BRIGHT
+                            + '*** LEVEL UP! lv {}  +2 max HP, +1 max MP, fully restored'.format(
+                                state['level'])
+                            + Style.RESET_ALL)
 
 
 def mana_bar(mana, mana_max):
@@ -235,16 +267,25 @@ def draw(state):
     score_str = Style.BRIGHT + Fore.LIGHTYELLOW_EX + str(state['score']) + Style.RESET_ALL
     best_str = Fore.LIGHTBLACK_EX + 'best ' + str(state['best']) + Style.RESET_ALL
     boss_str = Style.BRIGHT + Fore.LIGHTMAGENTA_EX + str(state['bosses']) + Style.RESET_ALL
+    nxt = next_xp_threshold(state['level'])
+    if nxt is None:
+        lvl_str = Fore.LIGHTGREEN_EX + Style.BRIGHT + 'lv {} (MAX)'.format(state['level']) + Style.RESET_ALL
+    else:
+        lvl_str = (Fore.LIGHTGREEN_EX + Style.BRIGHT + 'lv {}'.format(state['level']) + Style.RESET_ALL
+                   + ' ' + Fore.LIGHTBLACK_EX + '{}/{}xp'.format(state['xp'], nxt) + Style.RESET_ALL)
     extras = ''
+    d = depth(px, py)
+    if d > 0:
+        extras += '   ' + Fore.LIGHTMAGENTA_EX + 'depth {}'.format(d) + Style.RESET_ALL
     if state['combo'] >= 2:
         extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
     if is_crit_tile(px, py):
         extras += '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'CRIT READY' + Style.RESET_ALL
-    print('{}   pos ({:>4},{:>4})   score {} ({})   bosses {}   steps {}{}'.format(
-        title, px, py, score_str, best_str, boss_str, state['steps'], extras))
+    print('{}   pos ({:>4},{:>4})   {}   score {} ({})   bosses {}   steps {}{}'.format(
+        title, px, py, lvl_str, score_str, best_str, boss_str, state['steps'], extras))
     hint = Fore.LIGHTBLACK_EX + 'wasd  WASD sprint  c conjure  q quit' + Style.RESET_ALL
     print('HP [{}]  MP [{}]  inv {}   {}'.format(
-        hp_bar(state['hp']), mana_bar(state['mana'], state['mana_max']),
+        hp_bar(state['hp'], state['hp_max']), mana_bar(state['mana'], state['mana_max']),
         inventory_str(state), hint))
     border = '+' + '-' * VIEW_W + '+'
     print(border)
@@ -289,14 +330,16 @@ def draw(state):
 def fresh_state(best):
     state = {
         'px': 0, 'py': 0,
-        'score': 0, 'hp': START_HP, 'mana': START_MANA, 'mana_max': MAX_MANA,
+        'score': 0, 'xp': 0, 'level': 1,
+        'hp': START_HP, 'hp_max': START_HP,
+        'mana': START_MANA, 'mana_max': MAX_MANA,
         'steps': 0, 'bosses': 0, 'combo': 0,
         'best': best,
         'seen': set(), 'collected': set(), 'defeated': set(),
         'used_fountains': set(), 'conjured': set(), 'items_picked': set(),
         'has_sword': False, 'has_shield': False, 'has_ring': False,
         'enemy_hp': {},
-        'log': ['Welcome! / sword  o shield  * ring   Stand on a 7-digit for CRIT.'],
+        'log': ['Welcome! Earn XP to level up. Treasures, enemies, and bosses give XP.'],
     }
     update_seen(state['seen'], 0, 0)
     return state
@@ -313,6 +356,15 @@ def is_crit_tile(x, y):
     return PI_DIGITS[_pi_index(x, y)] == CRIT_DIGIT
 
 
+def depth(x, y):
+    """0 near origin, +1 every 20 chebyshev tiles outward."""
+    return max(abs(x), abs(y)) // 20
+
+
+def depth_mult(state):
+    return 1 + depth(state['px'], state['py'])
+
+
 def attack_damage(state):
     crit = is_crit_tile(state['px'], state['py'])
     base = 2 if crit else 1
@@ -322,11 +374,12 @@ def attack_damage(state):
 
 
 def resolve_combat(state, kind, ex, ey):
-    """Process one attack. Returns True if the enemy was defeated this hit."""
+    """Process one attack. Returns True if the enemy was defeated this hit.
+
+    No immediate counter-damage is applied here -- end-of-turn retaliation
+    handles surviving adjacent foes via enemy_retaliation().
+    """
     max_hp = BOSS_MAX_HP if kind == 'boss' else ENEMY_MAX_HP
-    counter = BOSS_COUNTER if kind == 'boss' else ENEMY_COUNTER
-    if state['has_shield']:
-        counter = max(0, counter - 1)
     cur = state['enemy_hp'].get((ex, ey), max_hp)
     dmg, crit = attack_damage(state)
     cur -= dmg
@@ -334,24 +387,55 @@ def resolve_combat(state, kind, ex, ey):
     if cur <= 0:
         state['defeated'].add((ex, ey))
         state['enemy_hp'].pop((ex, ey), None)
+        mult = depth_mult(state)
         if kind == 'boss':
-            state['score'] += 5
+            reward = 5 * mult
+            state['score'] += reward
             state['bosses'] += 1
+            gain_xp(state, XP_BOSS)
             state['log'].append(crit_label + Fore.LIGHTMAGENTA_EX + Style.BRIGHT
-                                + '*** BOSS SLAIN *** +5 score' + Style.RESET_ALL)
+                                + '*** BOSS SLAIN *** +{} score'.format(reward)
+                                + Style.RESET_ALL)
         else:
-            state['score'] += 1
+            reward = 1 * mult
+            state['score'] += reward
+            gain_xp(state, XP_ENEMY)
             state['log'].append(crit_label + Fore.LIGHTRED_EX + Style.BRIGHT
-                                + 'Enemy slain! +1 score' + Style.RESET_ALL)
+                                + 'Enemy slain! +{} score'.format(reward)
+                                + Style.RESET_ALL)
         return True
     state['enemy_hp'][(ex, ey)] = cur
-    state['hp'] -= counter
-    state['combo'] = 0
     label = 'boss' if kind == 'boss' else 'enemy'
     state['log'].append(crit_label + Fore.LIGHTRED_EX
-                        + 'Strike {} ({} HP left). It counters -{} HP.'.format(label, cur, counter)
+                        + 'Strike {} ({} HP left).'.format(label, cur)
                         + Style.RESET_ALL)
     return False
+
+
+def enemy_retaliation(state):
+    """Every live foe orthogonally adjacent to the player strikes back."""
+    px, py = state['px'], state['py']
+    total = 0
+    parts = []
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        ex, ey = px + dx, py + dy
+        kind = enemy_kind(ex, ey)
+        if not kind or (ex, ey) in state['defeated']:
+            continue
+        counter = BOSS_COUNTER if kind == 'boss' else ENEMY_COUNTER
+        if state['has_shield']:
+            counter = max(0, counter - 1)
+        if counter <= 0:
+            parts.append(('shielded ' + kind))
+            continue
+        state['hp'] -= counter
+        total += counter
+        parts.append('{}-{}'.format(kind, counter))
+    if total > 0:
+        state['combo'] = 0
+        state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
+                            + 'Foes retaliate! ({}) total -{} HP'.format(', '.join(parts), total)
+                            + Style.RESET_ALL)
 
 
 def try_move(state, dx, dy):
@@ -370,8 +454,8 @@ def try_move(state, dx, dy):
     update_seen(state['seen'], nx, ny)
     if (healing_at(nx, ny)
             and (nx, ny) not in state['used_fountains']
-            and state['hp'] < START_HP):
-        heal = min(START_HP - state['hp'], 3)
+            and state['hp'] < state['hp_max']):
+        heal = min(state['hp_max'] - state['hp'], 3)
         state['hp'] += heal
         state['used_fountains'].add((nx, ny))
         state['log'].append(Fore.LIGHTCYAN_EX + Style.BRIGHT
@@ -400,18 +484,22 @@ def try_move(state, dx, dy):
     if target == TREASURE and (nx, ny) not in state['collected']:
         state['collected'].add((nx, ny))
         state['combo'] += 1
-        bonus = state['combo']
+        mult = depth_mult(state)
+        bonus = state['combo'] * mult
         state['score'] += bonus
+        gain_xp(state, XP_TREASURE)
         gained_mana = state['mana'] < state['mana_max']
         state['mana'] = min(state['mana_max'], state['mana'] + 1)
         suffix = ', +1 MP' if gained_mana else ''
-        if bonus > 1:
+        depth_tag = ' x{}d'.format(mult) if mult > 1 else ''
+        if state['combo'] > 1:
             state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                                + 'Treasure! +{} (combo x{}){}'.format(bonus, state['combo'], suffix)
+                                + 'Treasure! +{} (combo x{}{}){}'.format(
+                                    bonus, state['combo'], depth_tag, suffix)
                                 + Style.RESET_ALL)
         else:
             state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                                + 'You found treasure! +1{}'.format(suffix) + Style.RESET_ALL)
+                                + 'Treasure! +{}{}'.format(bonus, suffix) + Style.RESET_ALL)
     elif target == MOUNTAIN:
         state['log'].append('You scramble up a rocky slope.')
     elif target == FOREST:
@@ -451,7 +539,7 @@ def conjure(state):
                             + 'SIGHT conjured: distant lands revealed.' + Style.RESET_ALL)
     elif d <= 5:
         # Mend: heal HP
-        heal = min(START_HP - state['hp'], 3)
+        heal = min(state['hp_max'] - state['hp'], 3)
         state['hp'] += heal
         state['log'].append(Fore.LIGHTGREEN_EX + Style.BRIGHT
                             + 'MEND conjured: +{} HP.'.format(heal) + Style.RESET_ALL)
@@ -459,6 +547,7 @@ def conjure(state):
         # Ward: banish nearby foes
         count = 0
         bosses = 0
+        mult = depth_mult(state)
         for dy in range(-2, 3):
             for dx in range(-2, 3):
                 if dx * dx + dy * dy <= 4:
@@ -471,17 +560,21 @@ def conjure(state):
                         if kind == 'boss':
                             bosses += 1
                             state['bosses'] += 1
-                            state['score'] += 5
+                            state['score'] += 5 * mult
+                            gain_xp(state, XP_BOSS)
                         else:
-                            state['score'] += 1
+                            state['score'] += 1 * mult
+                            gain_xp(state, XP_ENEMY)
         state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
                             + 'WARD conjured: {} foes banished ({} boss).'.format(count, bosses)
                             + Style.RESET_ALL)
     else:
         # Hoard: pull score from thin air
-        state['score'] += 5
+        gain = 5 * depth_mult(state)
+        state['score'] += gain
         state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                            + 'HOARD conjured: +5 score from the digits.' + Style.RESET_ALL)
+                            + 'HOARD conjured: +{} score from the digits.'.format(gain)
+                            + Style.RESET_ALL)
 
 
 def end_screen(state, message):
@@ -495,7 +588,9 @@ def end_screen(state, message):
               + 'New best score: {}!'.format(best) + Style.RESET_ALL)
     else:
         print('Final score: {}   (best {})'.format(state['score'], best))
-    print('Bosses slain: {}   Steps: {}'.format(state['bosses'], state['steps']))
+    print('Level reached: {}   Bosses slain: {}   Steps: {}   Max depth: {}'.format(
+        state['level'], state['bosses'], state['steps'],
+        depth(state['px'], state['py'])))
 
 
 def run_game(best):
@@ -516,6 +611,7 @@ def run_game(best):
             return 'quit', state['score']
         if ch == 'c':
             conjure(state)
+            enemy_retaliation(state)
             continue
         if ch not in moves:
             continue
@@ -524,6 +620,8 @@ def run_game(best):
         try_move(state, dx, dy)
         if sprint and state['hp'] > 0:
             try_move(state, dx, dy)
+        if state['hp'] > 0:
+            enemy_retaliation(state)
 
 
 def main():
