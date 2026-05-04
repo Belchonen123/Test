@@ -4,9 +4,10 @@ Run:
     pip install mpmath colorama
     python pi_world.py
 
-Controls: WASD to move, q to quit. After death, press r to restart.
+Controls: wasd move, WASD sprint (2 tiles), q quit, r restart on death.
 """
 
+import json
 import os
 import sys
 
@@ -25,6 +26,23 @@ START_DIGIT = 1047
 VIEW_W, VIEW_H = 21, 11
 SIGHT_RADIUS = 4
 START_HP = 10
+SCORE_FILE = os.path.expanduser('~/.pi_world_score')
+
+
+def load_high_score():
+    try:
+        with open(SCORE_FILE) as f:
+            return int(json.load(f).get('high_score', 0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def save_high_score(score):
+    try:
+        with open(SCORE_FILE, 'w') as f:
+            json.dump({'high_score': int(score)}, f)
+    except OSError:
+        pass
 
 WATER, GRASS, FOREST, MOUNTAIN, TREASURE = 'water', 'grass', 'forest', 'mountain', 'treasure'
 
@@ -128,9 +146,10 @@ def clear_screen():
 
 
 def getch():
+    """Returns the raw single-character keypress, case preserved."""
     try:
         import msvcrt
-        return msvcrt.getch().decode('utf-8', errors='ignore').lower()
+        return msvcrt.getch().decode('utf-8', errors='ignore')
     except ImportError:
         import termios
         import tty
@@ -141,7 +160,7 @@ def getch():
             ch = sys.stdin.read(1)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        return ch.lower()
+        return ch
 
 
 def update_seen(seen, px, py):
@@ -158,10 +177,14 @@ def draw(state):
     half_w, half_h = VIEW_W // 2, VIEW_H // 2
     title = Style.BRIGHT + Fore.CYAN + 'Pi World' + Style.RESET_ALL
     score_str = Style.BRIGHT + Fore.LIGHTYELLOW_EX + str(state['score']) + Style.RESET_ALL
+    best_str = Fore.LIGHTBLACK_EX + 'best ' + str(state['best']) + Style.RESET_ALL
     boss_str = Style.BRIGHT + Fore.LIGHTMAGENTA_EX + str(state['bosses']) + Style.RESET_ALL
-    print('{}   pos ({:>4},{:>4})   score {}   bosses {}   steps {}'.format(
-        title, px, py, score_str, boss_str, state['steps']))
-    hint = Fore.LIGHTBLACK_EX + 'WASD move, q quit' + Style.RESET_ALL
+    combo_str = ''
+    if state['combo'] >= 2:
+        combo_str = '   ' + Fore.LIGHTYELLOW_EX + Style.BRIGHT + 'combo x{}'.format(state['combo']) + Style.RESET_ALL
+    print('{}   pos ({:>4},{:>4})   score {} ({})   bosses {}   steps {}{}'.format(
+        title, px, py, score_str, best_str, boss_str, state['steps'], combo_str))
+    hint = Fore.LIGHTBLACK_EX + 'wasd move  WASD sprint  q quit' + Style.RESET_ALL
     print('HP [{}]   {}'.format(hp_bar(state['hp']), hint))
     border = '+' + '-' * VIEW_W + '+'
     print(border)
@@ -200,10 +223,11 @@ def draw(state):
         print(entry if entry else ' ')
 
 
-def fresh_state():
+def fresh_state(best):
     state = {
         'px': 0, 'py': 0,
-        'score': 0, 'hp': START_HP, 'steps': 0, 'bosses': 0,
+        'score': 0, 'hp': START_HP, 'steps': 0, 'bosses': 0, 'combo': 0,
+        'best': best,
         'seen': set(), 'collected': set(), 'defeated': set(), 'used_fountains': set(),
         'log': ['Welcome to Pi World! $ treasure  E enemy  B boss  + fountain'],
     }
@@ -211,72 +235,102 @@ def fresh_state():
     return state
 
 
-def run_game():
-    state = fresh_state()
+def try_move(state, dx, dy):
+    """Apply one step of (dx, dy). Returns False if blocked by water."""
+    nx, ny = state['px'] + dx, state['py'] + dy
+    target = tile_at(nx, ny)
+    if target == WATER:
+        state['log'].append(Fore.CYAN + 'Splash! Water blocks your path.' + Style.RESET_ALL)
+        return False
+    kind = enemy_kind(nx, ny)
+    if kind and (nx, ny) not in state['defeated']:
+        state['defeated'].add((nx, ny))
+        state['combo'] = 0
+        if kind == 'boss':
+            state['hp'] -= 3
+            state['score'] += 5
+            state['bosses'] += 1
+            state['log'].append(Fore.LIGHTMAGENTA_EX + Style.BRIGHT
+                                + '*** BOSS SLAIN *** -3 HP, +5 score' + Style.RESET_ALL)
+        else:
+            state['hp'] -= 1
+            state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
+                                + 'You defeat an enemy! -1 HP' + Style.RESET_ALL)
+    state['px'], state['py'] = nx, ny
+    state['steps'] += 1
+    update_seen(state['seen'], nx, ny)
+    if (healing_at(nx, ny)
+            and (nx, ny) not in state['used_fountains']
+            and state['hp'] < START_HP):
+        heal = min(START_HP - state['hp'], 3)
+        state['hp'] += heal
+        state['used_fountains'].add((nx, ny))
+        state['log'].append(Fore.LIGHTCYAN_EX + Style.BRIGHT
+                            + 'You drink from a fountain! +{} HP'.format(heal)
+                            + Style.RESET_ALL)
+    if target == TREASURE and (nx, ny) not in state['collected']:
+        state['collected'].add((nx, ny))
+        state['combo'] += 1
+        bonus = state['combo']
+        state['score'] += bonus
+        if bonus > 1:
+            state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+                                + 'Treasure! +{} (combo x{})'.format(bonus, state['combo'])
+                                + Style.RESET_ALL)
+        else:
+            state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+                                + 'You found treasure! +1' + Style.RESET_ALL)
+    elif target == MOUNTAIN:
+        state['log'].append('You scramble up a rocky slope.')
+    elif target == FOREST:
+        state['log'].append('You push through the trees.')
+    return True
+
+
+def end_screen(state, message):
+    clear_screen()
+    print(message)
+    new_best = state['score'] > state['best']
+    best = max(state['best'], state['score'])
+    if new_best:
+        save_high_score(best)
+        print(Fore.LIGHTYELLOW_EX + Style.BRIGHT
+              + 'New best score: {}!'.format(best) + Style.RESET_ALL)
+    else:
+        print('Final score: {}   (best {})'.format(state['score'], best))
+    print('Bosses slain: {}   Steps: {}'.format(state['bosses'], state['steps']))
+
+
+def run_game(best):
+    state = fresh_state(best)
     moves = {'w': (0, -1), 's': (0, 1), 'a': (-1, 0), 'd': (1, 0)}
     while True:
         draw(state)
         if state['hp'] <= 0:
-            print(Fore.LIGHTRED_EX + Style.BRIGHT + 'You have fallen. Game over.' + Style.RESET_ALL)
-            print('Final score: {}   Bosses slain: {}   Steps: {}'.format(
-                state['score'], state['bosses'], state['steps']))
+            end_screen(state, Fore.LIGHTRED_EX + Style.BRIGHT
+                       + 'You have fallen. Game over.' + Style.RESET_ALL)
             print(Fore.LIGHTBLACK_EX + 'Press r to restart, q to quit.' + Style.RESET_ALL)
-            ch = getch()
-            return 'restart' if ch == 'r' else 'quit'
-        ch = getch()
+            ch = getch().lower()
+            return ('restart', state['score']) if ch == 'r' else ('quit', state['score'])
+        raw = getch()
+        ch = raw.lower()
         if ch == 'q':
-            clear_screen()
-            print('Final score: {}   Bosses slain: {}   Steps: {}'.format(
-                state['score'], state['bosses'], state['steps']))
-            print('Thanks for exploring Pi World!')
-            return 'quit'
+            end_screen(state, 'Thanks for exploring Pi World!')
+            return 'quit', state['score']
         if ch not in moves:
             continue
+        sprint = raw != ch  # uppercase WASD means sprint two tiles
         dx, dy = moves[ch]
-        nx, ny = state['px'] + dx, state['py'] + dy
-        target = tile_at(nx, ny)
-        if target == WATER:
-            state['log'].append(Fore.CYAN + 'Splash! Water blocks your path.' + Style.RESET_ALL)
-            continue
-        kind = enemy_kind(nx, ny)
-        if kind and (nx, ny) not in state['defeated']:
-            state['defeated'].add((nx, ny))
-            if kind == 'boss':
-                state['hp'] -= 3
-                state['score'] += 5
-                state['bosses'] += 1
-                state['log'].append(Fore.LIGHTMAGENTA_EX + Style.BRIGHT
-                                    + '*** BOSS SLAIN *** -3 HP, +5 score' + Style.RESET_ALL)
-            else:
-                state['hp'] -= 1
-                state['log'].append(Fore.LIGHTRED_EX + Style.BRIGHT
-                                    + 'You defeat an enemy! -1 HP' + Style.RESET_ALL)
-        state['px'], state['py'] = nx, ny
-        state['steps'] += 1
-        update_seen(state['seen'], nx, ny)
-        if (healing_at(nx, ny)
-                and (nx, ny) not in state['used_fountains']
-                and state['hp'] < START_HP):
-            heal = min(START_HP - state['hp'], 3)
-            state['hp'] += heal
-            state['used_fountains'].add((nx, ny))
-            state['log'].append(Fore.LIGHTCYAN_EX + Style.BRIGHT
-                                + 'You drink from a fountain! +{} HP'.format(heal)
-                                + Style.RESET_ALL)
-        if target == TREASURE and (nx, ny) not in state['collected']:
-            state['collected'].add((nx, ny))
-            state['score'] += 1
-            state['log'].append(Fore.LIGHTYELLOW_EX + Style.BRIGHT
-                                + 'You found treasure! +1' + Style.RESET_ALL)
-        elif target == MOUNTAIN:
-            state['log'].append('You scramble up a rocky slope.')
-        elif target == FOREST:
-            state['log'].append('You push through the trees.')
+        try_move(state, dx, dy)
+        if sprint and state['hp'] > 0:
+            try_move(state, dx, dy)
 
 
 def main():
+    best = load_high_score()
     while True:
-        outcome = run_game()
+        outcome, score = run_game(best)
+        best = max(best, score)
         if outcome != 'restart':
             return
 
